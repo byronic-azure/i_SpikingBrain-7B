@@ -173,8 +173,8 @@ class FlashAttention(nn.Module):
             if cache_has_content:
                 key_states, value_states = key_cached, value_cached
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        # No repeat_kv: flash_attn_func / flash_attn_varlen_func handle GQA natively
+        # (nheads_k divides nheads), so K/V stay at num_key_value_heads.
         
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)

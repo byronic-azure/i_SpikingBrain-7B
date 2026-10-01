@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 
@@ -8,12 +10,26 @@ except Exception as e:
     print('need https://github.com/BICLab/Int2Spike repo to do fake int2spike, ', e)
     spike_is_available = False
 
-def dynamic_spikes(x, k=3.0):
+# The bidirectional bitwise spike encode->decode in Int2Spike is an exact identity on
+# integer-valued inputs: T = ceil(log2(max|x| + 1)) bits always suffice, the decode
+# sums powers of two, and every partial sum of the set bits of an fp32 integer is
+# itself exactly representable in fp32. It only loses information outside its own
+# domain (non-finite or |x| >= 2**63 values, where the original path raises or is
+# undefined). Running it costs ~T extra fp32/int64 passes and 3+ host syncs per
+# linear layer, so by default we skip it. Set W8ASPIKE_SPIKE_ROUNDTRIP=1 (or pass
+# spike_roundtrip=True) to run the explicit spike path, e.g. to collect firing-rate
+# or sparsity statistics.
+SPIKE_ROUNDTRIP = os.environ.get("W8ASPIKE_SPIKE_ROUNDTRIP", "0") == "1"
+
+
+def dynamic_spikes(x, k=3.0, spike_roundtrip=None):
     vth = x.abs().mean([-1], keepdim=True).float() / k
     vth = vth.clamp(min=1e-5, max=1e4)
     spikes_int = (x / vth).round()
 
-    if spike_is_available:
+    if spike_roundtrip is None:
+        spike_roundtrip = SPIKE_ROUNDTRIP
+    if spike_roundtrip and spike_is_available:
         spikes_int = spike_fake_quant(spikes_int, lif_quantizer=SpikeCountBitwiseNode(is_bidirectional=True))
 
     return spikes_int, vth
@@ -25,6 +41,27 @@ class QuantLinear(nn.Linear):
         self.k = dynamic_sfr
         self.w_group_size = w_group_size
         self.weight_quantizer = Quantizer(in_features, out_features, w_group_size)
+        self.spike_roundtrip = None  # None -> follow the module-level SPIKE_ROUNDTRIP default
+        self._wq_key = None
+
+    def _weight_key(self):
+        w, s = self.weight, self.weight_quantizer.scales
+        return (w.data_ptr(), w._version, w.device, w.dtype, s.data_ptr(), s._version)
+
+    def quantized_weight(self):
+        """Fake-quantize the weight once and fold the result into ``self.weight``.
+
+        Folding in place keeps memory flat (no second 7B-sized copy). The fold is
+        redone whenever the weight or scales storage changes (``load_state_dict``,
+        ``.to()``, any in-place write), tracked by data pointer and version counter.
+        Re-quantizing already-folded weights is exact as long as |W / scale| <= 255
+        (any int8 grid) in bf16, and in fp16/fp32.
+        """
+        if self._wq_key != self._weight_key():
+            with torch.no_grad():
+                self.weight.copy_(self.weight_quantizer(self.weight))
+            self._wq_key = self._weight_key()
+        return self.weight
 
     def forward(self, x):
         # BLD
@@ -43,9 +80,9 @@ class QuantLinear(nn.Linear):
         #     o = (o * vth.float()).to(self.weight)
         # return o
 
-        spikes_int, vth = dynamic_spikes(x, self.k)
+        spikes_int, vth = dynamic_spikes(x, self.k, self.spike_roundtrip)
         x = (spikes_int * vth).to(x.dtype)
-        weight = self.weight_quantizer(self.weight)
+        weight = self.quantized_weight()
         out = torch.nn.functional.linear(x, weight, self.bias)
         return out
 

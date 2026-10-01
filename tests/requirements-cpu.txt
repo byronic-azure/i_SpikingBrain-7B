@@ -1,0 +1,8 @@
+# CPU-only test environment (no GPU, no flash-attn / fla: tests/cpu_stubs.py stands in for them)
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   pip install -r tests/requirements-cpu.txt && python -m pytest tests && python tests/compare_with_ref.py
+transformers==4.45.2
+triton
+einops
+matplotlib
+pytest

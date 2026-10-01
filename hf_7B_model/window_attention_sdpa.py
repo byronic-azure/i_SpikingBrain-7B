@@ -183,15 +183,24 @@ class FlashAttention(nn.Module):
             if cache_has_content:
                 key_states, value_states = key_cached, value_cached
 
-        key_states   = repeat_kv(key_states,   self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        # GQA without materializing K/V per query head: for short queries (decode) fold the
+        # query-head group into the query-length axis, [B, H, Q, D] -> [B, Hkv, G*Q, D], so
+        # every SDPA backend sees matching head counts. The price is a G× larger mask, which
+        # is cheaper than repeat_kv while Q < 2 * Hkv * D; long prefills keep repeat_kv.
+        n_rep = self.num_key_value_groups
+        fold_gqa = n_rep > 1 and q_len < 2 * self.num_key_value_heads * self.head_dim
+        if fold_gqa:
+            query_states = query_states.reshape(bsz, self.num_key_value_heads, n_rep * q_len, self.head_dim)
+        else:
+            key_states   = repeat_kv(key_states,   n_rep)
+            value_states = repeat_kv(value_states, n_rep)
 
-        # query: [B, H, Q, D], key/value: [B, H, K, D]
+        # query: [B, H, Q, D] (or [B, Hkv, G*Q, D] when folded), key/value: [B, H or Hkv, K, D]
         q = query_states
         k = key_states
         v = value_states
         K = k.shape[2]
-        Q = q.shape[2]
+        Q = q_len
 
         swa_mask = self._build_sliding_causal_mask(Q, K, self.sliding_window, device=q.device).view(1, 1, Q, K)
 
@@ -203,6 +212,9 @@ class FlashAttention(nn.Module):
             attn_mask = swa_mask
 
         attn_mask = torch.where(attn_mask[:,:,-Q:,:], -torch.inf, 0.0).to(q.dtype)
+        if fold_gqa:
+            # folded query row g*Q + i is query position i
+            attn_mask = attn_mask.repeat(1, 1, n_rep, 1)
 
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
@@ -212,6 +224,8 @@ class FlashAttention(nn.Module):
         )
         # FIXME: Handle potential NaN in attention output during prefilling with attention masks.
         attn_output = torch.nan_to_num(attn_output, nan=0.0)
+        if fold_gqa:
+            attn_output = attn_output.reshape(bsz, self.num_heads, Q, self.head_dim)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, Q, self.num_heads * self.head_dim)

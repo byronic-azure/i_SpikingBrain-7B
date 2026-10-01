@@ -16,6 +16,8 @@
 | 7 | vLLM | Prefill loops over requests in Python and syncs on GPU scalars | 3+ syncs × requests × 14 layers per step | M |
 | 8 | vLLM | GLA recurrent state is stored in **bf16** | Precision drift over long contexts; 3 GiB at `max_num_seqs=256` | S (trade-off) |
 
+**Status:** items 1–4 are implemented (weight fold cache, spike round-trip skip, `logits_to_keep`, GQA without `repeat_kv` where the kernel allows it). CPU equivalence tests live in `tests/`; `run_model/bench_decode.py` measures decode latency and peak memory on a GPU. The impact figures above are still analytical until that benchmark is run.
+
 ---
 
 ## 1. Model shape (the numbers that drive everything)
