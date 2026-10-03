@@ -385,6 +385,10 @@ class GLAswaForCausalLM(HybridPreTrainedModel):
             'position_ids': position_ids,
             'cache_position': cache_position,
         })
+        # `generate()` asks for last-position logits only (transformers <4.50 / >=4.50 names).
+        for key in ('num_logits_to_keep', 'logits_to_keep'):
+            if kwargs.get(key) is not None:
+                model_inputs[key] = kwargs[key]
         return model_inputs
 
     def forward(
@@ -400,7 +404,16 @@ class GLAswaForCausalLM(HybridPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        num_logits_to_keep: Optional[int] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        r"""
+        logits_to_keep (`int` or `torch.Tensor`, defaults to 0):
+            Same convention as upstream transformers: an int `k > 0` computes logits only for the last `k`
+            positions (`generate()` passes 1, so prefill no longer materializes `[batch, seq, vocab]` logits);
+            0 keeps all positions. A 1D tensor selects explicit sequence indices.
+            `num_logits_to_keep` is the transformers<4.50 name for the same argument.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -421,6 +434,15 @@ class GLAswaForCausalLM(HybridPreTrainedModel):
         )
 
         hidden_states = outputs[0]
+        if num_logits_to_keep is not None:
+            logits_to_keep = num_logits_to_keep
+        # The loss needs every position, so slicing only applies when no labels are given.
+        if labels is None:
+            if isinstance(logits_to_keep, int):
+                if logits_to_keep > 0:
+                    hidden_states = hidden_states[:, -logits_to_keep:, :]
+            else:
+                hidden_states = hidden_states[:, logits_to_keep, :]
         logits = self.lm_head(hidden_states)
 
         loss = None

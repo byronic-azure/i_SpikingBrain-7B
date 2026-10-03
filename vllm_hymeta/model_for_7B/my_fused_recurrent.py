@@ -14,10 +14,12 @@ def my_fused_recurrent_fwd_kernel(
     kv_cache_ptr, 
     slot_idx,
     scale, # D ** -0.5
-    qkv_b_stride, qkv_h_stride,
+    q_b_stride, q_h_stride,
+    kv_b_stride, kv_h_stride,
     cache_b_stride, cache_h_stride,
     cache_d0_stride, cache_d1_stride,
-    BLOCK_SIZE: tl.constexpr
+    BLOCK_SIZE: tl.constexpr,
+    GROUP_SIZE: tl.constexpr, # num_heads // num_kv_heads (GQA); k/v/g are read at head_id // GROUP_SIZE
 ):
     """
     Kernel for linear attention decoding with KV cache.
@@ -46,9 +48,10 @@ def my_fused_recurrent_fwd_kernel(
     cache_d_offsets = qk_d_offsets[:, None] * cache_d0_stride + v_d_offsets[None, :] * cache_d1_stride # [D, BLOCK_SIZE]
 
     # Caculate offsets for the current batch and head
-    q_offset = batch_id * qkv_b_stride + head_id * qkv_h_stride
-    k_offset = batch_id * qkv_b_stride + head_id * qkv_h_stride
-    v_offset = batch_id * qkv_b_stride + head_id * qkv_h_stride
+    kv_head_id = head_id // GROUP_SIZE
+    q_offset = batch_id * q_b_stride + head_id * q_h_stride
+    k_offset = batch_id * kv_b_stride + kv_head_id * kv_h_stride
+    v_offset = batch_id * kv_b_stride + kv_head_id * kv_h_stride
 
     cache_offset = slot_idx * cache_b_stride + head_id * cache_h_stride
 
@@ -87,10 +90,14 @@ class MyFusedRecurrentFunction(torch.autograd.Function):
     @autocast_custom_fwd
     def forward(ctx, q, k, v, g, kv_caches, slot_idx, scale=None, initial_state=None, output_final_state=False, reverse=False):
         B, H, _, D = q.shape
+        H_kv = k.shape[1]
 
-        # used for decoding, so we assume the sequence length is 1
-        assert k.shape == (B, H, 1, D)
-        assert v.shape == (B, H, 1, D)
+        # used for decoding, so we assume the sequence length is 1.
+        # k/v/g may have fewer heads than q (GQA); the kernel maps query head h to kv head h // (H // H_kv).
+        assert H % H_kv == 0
+        assert k.shape == (B, H_kv, 1, D)
+        assert v.shape == (B, H_kv, 1, D)
+        assert g.shape == (B, H_kv, 1, D)
 
         # default scale
         if scale is None:
@@ -101,7 +108,8 @@ class MyFusedRecurrentFunction(torch.autograd.Function):
         BLOCK_SIZE = 64
         grid = (B, H, D // BLOCK_SIZE)
 
-        qkv_b_stride, qkv_h_stride = q.stride(0), q.stride(1)
+        q_b_stride, q_h_stride = q.stride(0), q.stride(1)
+        kv_b_stride, kv_h_stride = k.stride(0), k.stride(1)
 
         cache_b_stride, cache_h_stride = kv_caches.stride(0), kv_caches.stride(1)
         cache_d0_stride, cache_d1_stride = kv_caches.stride(2), kv_caches.stride(3)
@@ -109,10 +117,12 @@ class MyFusedRecurrentFunction(torch.autograd.Function):
         my_fused_recurrent_fwd_kernel[grid](
             q, k, v, g, output, D,
             kv_caches, slot_idx, scale,
-            qkv_b_stride, qkv_h_stride,
+            q_b_stride, q_h_stride,
+            kv_b_stride, kv_h_stride,
             cache_b_stride, cache_h_stride,
             cache_d0_stride, cache_d1_stride,
             BLOCK_SIZE,
+            H // H_kv,
         )
         output = output.transpose(1, 2).contiguous() # [b, h, l, d] --> [b, l, h, d]
         # output = rearrange(output, 'b h l d -> b l (h d)')
