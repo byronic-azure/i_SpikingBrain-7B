@@ -37,7 +37,6 @@ def calibrate_scales(model):
             if isinstance(m, QuantLinear):
                 w = m.weight.float().reshape(m.out_features, -1, m.w_group_size)
                 m.weight_quantizer.scales.copy_(w.abs().amax(-1, keepdim=True).clamp(min=1e-8) / 127)
-                m._wq_key = None
 
 
 def tiny_model(pkg, seed=0, **overrides):

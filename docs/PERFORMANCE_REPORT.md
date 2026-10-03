@@ -100,7 +100,7 @@ Grid `(B, H, D/64)` = `(B, 28, 2)`. Each program loads a 128×64 fp32 state tile
 **Fix:** the output is deterministic, so fold it once at load time (`self.weight.data = quantizer(self.weight)`) and drop the quantizer from `forward`. To keep real memory savings as well, store int8 weights with per-group scales and use an int8 GEMM such as Marlin.
 
 ### 4.2 Spike round-trip is a numerical no-op (#2)
-`dynamic_spikes` (`quant_linear.py:17`) rounds activations to integers, then calls `spike_fake_quant(..., SpikeCountBitwiseNode(is_bidirectional=True))`. That function encodes each integer into T sign-magnitude bits and decodes it back with powers of two. Because T = ⌈log₂(max|x|+1)⌉, the round-trip is **exact**.
+`dynamic_spikes` (`quant_linear.py:17`) rounds activations to integers, then calls `spike_fake_quant(..., SpikeCountBitwiseNode(is_bidirectional=True))`. That function encodes each integer into T sign-magnitude bits and decodes it back with powers of two. Because T = ⌈log₂(max|x|+1)⌉, the round-trip is **exact** for every integer input with max|x| < 2⁴⁹ (with the 1e4 cap on vth that covers |x| up to ~5.6e18; beyond it, an exact power-of-two maximum makes `math.log2` round T one bit short and the original path zeroes those elements).
 
 > Verified: in a numpy replica of `neuronal_charge`, `neuronal_fire` and `spike_dequant` over 200 random activation batches with outliers, the maximum reconstruction error was **0**, with T between 8 and 10.
 
@@ -122,4 +122,4 @@ It also has a latent failure: if an activation tensor is ever entirely ≥ 0, `s
 3. **Kernel work:** §3.2 GQA-aware decode kernel, §3.1 varlen batched prefill, §3.3 fused `g_norm` epilogue.
 4. **Accuracy experiment:** §3.4 fp32 vs bf16 GLA state on long-context retrieval.
 
-**Benchmark to add before merging any of these:** `run_model/` has no timing harness. Add a script that reports TTFT and tokens/s for prompts of {4k, 32k, 128k} × batch sizes {1, 8, 32}, plus peak memory (`torch.cuda.max_memory_allocated`). Run it before and after each change so the impact claims above become measured numbers.
+**Benchmark before merging any of these:** `run_model/bench_decode.py` reports TTFT, tokens/s and peak memory (`torch.cuda.max_memory_allocated`) for prompt lengths × batch sizes (`--prompt-lens`, `--batch-sizes`, e.g. {4k, 32k, 128k} × {1, 8, 32}). Run it with the same arguments on `main` and on the branch and compare the JSON (`--json`), so the impact claims above become measured numbers.

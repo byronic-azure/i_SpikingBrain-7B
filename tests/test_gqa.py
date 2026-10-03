@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 import cpu_stubs
-from conftest import ROOT, load_pkg
+from conftest import ROOT, calibrate_scales, load_pkg
 
 
 def _repeat_kv(x, n_rep):
@@ -28,6 +28,12 @@ def _reference_swa(attn, x, window_left, prefix=None):
     cos, sin = attn.rotary_emb(v, pos)
     q, k = mod.apply_rotary_pos_emb(q, k, cos, sin)
     k, v = _repeat_kv(k, attn.num_key_value_groups), _repeat_kv(v, attn.num_key_value_groups)
+    if hasattr(mod, "quantize_sym"):
+        # W8ASpike's old path quantized q/k/v *after* repeat_kv; the new one does it on Hkv-head
+        # tensors. Both reduce over head_dim only, so the results must agree exactly.
+        q_int, vth = mod.dynamic_spikes(q, 3.0)
+        q = (q_int * vth).to(q.dtype)
+        k, v = mod.quantize_sym(k), mod.quantize_sym(v)
     i, j = torch.arange(L)[:, None], torch.arange(L)[None]
     mask = (j <= i) & (j >= i - window_left)
     o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
@@ -36,16 +42,17 @@ def _reference_swa(attn, x, window_left, prefix=None):
 
 @pytest.mark.parametrize("q_len", [1, 5, 11])
 def test_flash_attention_layer_without_repeat_kv(pkg, q_len):
-    if pkg == "W8ASpike":
-        pytest.skip("W8ASpike also quantizes q/k/v; its layer is covered by the decode-vs-prefill test")
     modeling, _ = load_pkg(pkg)
     torch.manual_seed(0)
     attn = modeling.FlashAttention(hidden_size=256, num_heads=8, num_key_value_heads=2, sliding_window=4,
                                    layer_idx=0).eval()
+    if pkg == "W8ASpike":
+        calibrate_scales(attn)  # all-ones scales would round every weight, and the whole output, to 0
     x = torch.randn(2, q_len, 256)
     with torch.no_grad():
         out, _, _ = attn(x, attention_mask=torch.ones(2, q_len), position_ids=torch.arange(q_len)[None])
         ref = _reference_swa(attn, x, window_left=4)
+    assert out.abs().max() > 0
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
 
 
@@ -56,9 +63,15 @@ def test_flash_attention_decode_with_cache_matches_prefill(pkg):
     torch.manual_seed(0)
     attn = modeling.FlashAttention(hidden_size=256, num_heads=8, num_key_value_heads=2, sliding_window=64,
                                    layer_idx=0).eval()
+    if pkg == "W8ASpike":
+        # QuantLinear starts with all-ones scales, which round every (xavier-small) weight to 0 and
+        # make q/k/v, and with them both sides of this comparison, identically zero.
+        calibrate_scales(attn)
     x = torch.randn(1, 9, 256)
     with torch.no_grad():
         full, _, _ = attn(x, attention_mask=torch.ones(1, 9), position_ids=torch.arange(9)[None])
+    assert full.abs().max() > 0, "attention output is identically zero; the equivalence check below would be vacuous"
+    with torch.no_grad():
         cache = Cache()
         attn(x[:, :5], attention_mask=torch.ones(1, 5), position_ids=torch.arange(5)[None], past_key_values=cache)
         steps = []
