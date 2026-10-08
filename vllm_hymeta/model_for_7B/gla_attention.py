@@ -38,7 +38,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     if n_rep == 1:
         return hidden_states
-    if hidden_states.dim == 4:
+    if hidden_states.dim() == 4:
         batch, num_key_value_heads, slen, head_dim = hidden_states.shape 
         hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
         return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
@@ -189,10 +189,12 @@ class GatedLinearAttention(nn.Module):
             _end = attn_metadata.query_start_loc[_prefill_idx + 1]
             slot_id = state_indices_tensor[_prefill_idx]
 
+            # fused_chunk_gla needs equal head counts, so GQA expansion happens here, per prefill
+            # slice only; the decode kernel reads the un-expanded k/v/gk directly.
             q_slice = q[_start:_end].transpose(0, 1).contiguous() # [num_heads, num_tokens, head_dim]
-            k_slice = k[_start:_end].transpose(0, 1).contiguous()
-            v_slice = v[_start:_end].transpose(0, 1).contiguous()
-            gk_slice = gk[_start:_end].transpose(0, 1).contiguous()
+            k_slice = repeat_kv(k[_start:_end], self.num_key_value_groups).transpose(0, 1).contiguous()
+            v_slice = repeat_kv(v[_start:_end], self.num_key_value_groups).transpose(0, 1).contiguous()
+            gk_slice = repeat_kv(gk[_start:_end], self.num_key_value_groups).transpose(0, 1).contiguous()
             initial_state = kv_cache[slot_id, ...].unsqueeze(0) # [1, num_heads, head_dim, head_dim]
             if initial_state.isnan().any(): # 未初始化的 kv_cache 可能有 nan
                 initial_state = None
@@ -224,7 +226,7 @@ class GatedLinearAttention(nn.Module):
         # 因为解码的请求的长度都是 1， 这里的 num_tokens 维度等效于 batch 维度(同时处理多个解码请求)
         _start = attn_metadata.num_prefill_tokens
         q = q[_start:].unsqueeze(2).contiguous() # [batch=num_tokens, num_heads, seqlen=1, head_dim]
-        k = k[_start:].unsqueeze(2).contiguous()
+        k = k[_start:].unsqueeze(2).contiguous() # [batch, num_kv_heads, 1, head_dim]: GQA handled in-kernel
         v = v[_start:].unsqueeze(2).contiguous()
         gk = gk[_start:].unsqueeze(2).contiguous()
         slot_ids = state_indices_tensor[getattr(attn_metadata, "num_prefills", 0):]
@@ -261,10 +263,8 @@ class GatedLinearAttention(nn.Module):
         gk = gk[:, start_head:end_head, :]
         gk = F.logsigmoid(gk) / self.gate_logit_normalizer
 
-        # 这里之后可以优化不 repeat_kv 
-        k = repeat_kv(k, self.num_key_value_groups) # [num_tokens, num_heads, head_dim]
-        v = repeat_kv(v, self.num_key_value_groups)
-        gk = repeat_kv(gk, self.num_key_value_groups)
+        # k/v/gk stay at [num_tokens, num_kv_heads, head_dim]: the decode kernel indexes kv heads
+        # natively and the prefill path expands per request slice (see _prefill_and_mix_infer).
 
         kv_cache = kv_caches.gla_cache
         state_indices_tensor = kv_caches.state_indices_tensor
